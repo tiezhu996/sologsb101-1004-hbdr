@@ -26,11 +26,14 @@ import FactCheckIcon from '@mui/icons-material/FactCheck';
 import ReportProblemIcon from '@mui/icons-material/ReportProblem';
 import EventNoteIcon from '@mui/icons-material/EventNote';
 import TimelineIcon from '@mui/icons-material/Timeline';
+import MoveToInboxIcon from '@mui/icons-material/MoveToInbox';
 import ArchiveIcon from '@mui/icons-material/Archive';
 // 路径常量取自叶子模块 ./router/routes：App 在模块顶层就要用 ROUTES 构造菜单，
 // 若从 ./router（会 import App）引入会形成循环依赖 → TDZ「Cannot access before initialization」
 import { ROUTES } from './router/routes';
 import { initDatabase } from './utils/db';
+import { listIntakeBatches } from './utils/intakeDb';
+import { useIdbList } from './hooks/useIdbTable';
 import { refreshAll, subscribeStoreRefresh } from './stores';
 import { useAppSelector } from './hooks/useAppStore';
 import { selectFaultCounts } from './stores/faultStore';
@@ -45,6 +48,7 @@ const MENU = [
   { key: ROUTES.faults, label: '病害评定与销号', icon: <ReportProblemIcon /> },
   { key: ROUTES.workorders, label: '天窗作业单编排', icon: <EventNoteIcon /> },
   { key: ROUTES.progress, label: '作业进度与销号', icon: <TimelineIcon /> },
+  { key: ROUTES.intake, label: '离线包接收区', icon: <MoveToInboxIcon /> },
   { key: ROUTES.backup, label: '封锁条件与版本', icon: <ArchiveIcon /> },
 ];
 
@@ -56,6 +60,10 @@ export default function App() {
   const windowStats = useAppSelector(selectWindowStats);
   const activeYardId = useAppSelector((state) => state.yard.activeYardId);
   const error = useAppSelector((state) => state.yard.error || state.fault.error || state.workOrder.error);
+  const intakeBatches = useIdbList(listIntakeBatches);
+  const intakePending = intakeBatches.filter((batch) =>
+    batch.status === 'reviewing' || batch.status === 'paused' || batch.status === 'migrate',
+  ).length;
 
   useEffect(() => {
     let cancelled = false;
@@ -150,6 +158,14 @@ export default function App() {
             >
               <ListItemIcon sx={{ color: 'inherit', minWidth: 36 }}>{item.icon}</ListItemIcon>
               <ListItemText primary={item.label} primaryTypographyProps={{ fontSize: 13.5 }} />
+              {item.key === ROUTES.intake && intakePending > 0 && (
+                <Chip
+                  size="small"
+                  color="warning"
+                  label={intakePending}
+                  sx={{ height: 20, fontSize: 11, fontWeight: 700 }}
+                />
+              )}
             </ListItemButton>
           ))}
         </List>

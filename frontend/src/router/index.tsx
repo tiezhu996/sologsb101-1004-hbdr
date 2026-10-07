@@ -17,6 +17,7 @@ const InspectionEntry = lazy(() => import('../pages/InspectionEntry'));
 const FaultBoard = lazy(() => import('../pages/FaultBoard'));
 const WorkOrderPlan = lazy(() => import('../pages/WorkOrderPlan'));
 const ProgressView = lazy(() => import('../pages/ProgressView'));
+const IntakeView = lazy(() => import('../pages/IntakeView'));
 const BackupView = lazy(() => import('../pages/BackupView'));
 
 /** 兼容出口：路径常量请优先直接从 './routes' 引入（叶子模块，不产生环） */
@@ -46,6 +47,7 @@ export const appRoutes: RouteObject[] = [
       { path: 'faults', element: withSuspense(<FaultBoard />) },
       { path: 'workorders', element: withSuspense(<WorkOrderPlan />) },
       { path: 'progress', element: withSuspense(<ProgressView />) },
+      { path: 'intake', element: withSuspense(<IntakeView />) },
       { path: 'backup', element: withSuspense(<BackupView />) },
       { path: '*', element: <Navigate to={ROUTES.yards} replace /> },
     ],

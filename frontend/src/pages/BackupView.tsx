@@ -54,6 +54,7 @@ import {
   type SpeedRestrictionRow,
 } from '../utils/db';
 import { backupFilename, downloadJson, readJsonFile } from '../utils/format';
+import { exportOfflinePack } from '../utils/export';
 import { nowDateTime, shiftDate, todayDate } from '../utils/window';
 import { share } from '../utils/format';
 import StatBadge from '../components/common/StatBadge';
@@ -138,6 +139,16 @@ export default function BackupView() {
     setToast(`已导出 ${snapshot.yards.length} 个站场、${snapshot.faults.length} 处病害的 JSON 备份`);
   };
 
+  /** 巡检班无网收工：导出本班离线包（交回调度台先进接收区核准，不会整库覆盖） */
+  const handleExportPack = async (shift: '甲班' | '乙班'): Promise<void> => {
+    const pack = await exportOfflinePack({
+      shift,
+      note: `${shift}无网巡检交回：病害评定与天窗单`,
+    });
+    downloadJson(backupFilename(`gbrailswitch-offline-${shift === '乙班' ? 'yi' : 'jia'}`), pack);
+    setToast(`已导出${shift}离线包（包号 ${pack.packageId}）：${pack.faults.length} 处病害、${pack.workOrders.length} 张天窗单，请在「离线包接收区」交回`);
+  };
+
   const handleImport = async (file: File): Promise<void> => {
     try {
       const snapshot = await readJsonFile<DatabaseSnapshot>(file);
@@ -182,6 +193,12 @@ export default function BackupView() {
           </Button>
           <Button variant="outlined" startIcon={<CloudDownloadIcon />} onClick={() => void handleExport()}>
             导出 JSON
+          </Button>
+          <Button variant="outlined" color="secondary" onClick={() => void handleExportPack('甲班')}>
+            导出甲班离线包
+          </Button>
+          <Button variant="outlined" color="secondary" onClick={() => void handleExportPack('乙班')}>
+            导出乙班离线包
           </Button>
           <Button variant="outlined" component="label" startIcon={<CloudUploadIcon />}>
             导入 JSON

@@ -11,6 +11,7 @@ import type { Switch } from '../types/switch';
 import type { Inspection } from '../types/inspection';
 import type { Fault } from '../types/fault';
 import type { WorkOrder } from '../types/workOrder';
+import type { IntakeBatch } from '../types/intake';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 import { nowDateTime, shiftDate, todayDate, windowMinutes } from './window';
 import { nowIso, uuid } from './format';
@@ -19,10 +20,11 @@ import { nowIso, uuid } from './format';
 export const DB_NAME = 'gbrailswitch';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
+export type IntakeBatchRow = IntakeBatch;
 
 /** 封锁 / 慢行条件登记（/backup 页） */
 export interface SpeedRestriction extends Revisioned {
@@ -55,6 +57,8 @@ class RailSwitchDatabase extends Dexie {
   workOrders!: Table<WorkOrderRow, string>;
   restrictions!: Table<SpeedRestrictionRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
+  /** 离线包接收区批次（未核准前数据只存在这里，不动正式台账） */
+  intakeBatches!: Table<IntakeBatchRow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -113,6 +117,18 @@ class RailSwitchDatabase extends Dexie {
           if (!Array.isArray(row.machines)) row.machines = [];
         });
       });
+
+    // v3：新增离线包接收区表。批次整体作为单条文档存储，旧库无需迁移历史数据
+    this.version(DB_SCHEMA_VERSION).stores({
+      yards: 'id, name, region, mileage',
+      switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
+      inspections: 'id, switchId, date, inspector, [switchId+date]',
+      faults: 'id, inspectionId, part, severity, state, [inspectionId+part]',
+      workOrders: 'id, code, state, windowStart, leader',
+      restrictions: 'id, yardId, switchCode',
+      settings: 'id',
+      intakeBatches: 'id, packageId, contentHash, status, kind, receivedAt',
+    });
   }
 }
 
@@ -606,17 +622,18 @@ export async function resetDatabase(): Promise<void> {
   await seedDatabase();
 }
 
-/** 各表行数统计 */
+/** 各表行数统计（接收区返回待核准批次数） */
 export async function countAll(): Promise<Record<string, number>> {
-  const [yards, switches, inspections, faults, workOrders, restrictions] = await Promise.all([
+  const [yards, switches, inspections, faults, workOrders, restrictions, intakeBatches] = await Promise.all([
     db.yards.count(),
     db.switches.count(),
     db.inspections.count(),
     db.faults.count(),
     db.workOrders.count(),
     db.restrictions.count(),
+    db.intakeBatches.where('status').noneOf(['applied', 'rejected']).count(),
   ]);
-  return { yards, switches, inspections, faults, workOrders, restrictions };
+  return { yards, switches, inspections, faults, workOrders, restrictions, intakeBatches };
 }
 
 /** 结构版本信息 */

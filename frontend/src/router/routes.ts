@@ -13,6 +13,7 @@ export const ROUTES = {
   faults: '/faults',
   workorders: '/workorders',
   progress: '/progress',
+  intake: '/intake',
   backup: '/backup',
 } as const;
 

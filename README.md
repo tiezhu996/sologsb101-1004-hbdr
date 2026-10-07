@@ -29,6 +29,7 @@ docker compose up -d --build # 代码改动后重建
 - 勾选待修病害编排天窗作业单，分配时间窗 / 负责人 / 作业人员 / 机具，并做**时间窗 + 人员 + 机具三重冲突校验**
 - 按天窗批次推进状态（待编排 → 已下达 → 作业中 → 已完成），推进到已完成时**自动回写病害销号**
 - 登记慢行 / 封锁条件，查看结构版本并导出 / 导入整库 JSON
+- **离线包接收区**：巡检甲乙班无网作业各带一份本地数据，收工后把病害评定与天窗单交回，先入接收区逐项核准再合并（按道岔/日期/部件对回，等级/销号/编排冲突两份并存，双闸门成立才写台账，断点可续传）
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
 
@@ -54,6 +55,7 @@ docker compose up -d --build # 代码改动后重建
 | `/faults` | 病害评定与销号 | 评定等级、批量调整、手工销号与撤销 |
 | `/workorders` | 天窗作业单编排 | 勾选病害成单、分配时间窗与人员机具并校验冲突 |
 | `/progress` | 作业进度与销号回写 | 更新状态，完成项自动回写病害销号 |
+| `/intake` | 离线包接收区 | 甲乙班交回离线包，逐项核准后合并入台账 |
 | `/backup` | 封锁条件与版本 | 登记慢行 / 封锁条件，结构版本与 JSON 管理 |
 
 > 路由使用 `createBrowserRouter`（History 模式），真实路径 `/yards`、`/workorders` 等可直接访问，
@@ -80,20 +82,23 @@ sologsb101-1004/
         ├── main.tsx             # 入口：Redux Provider + ThemeProvider + RouterProvider
         ├── App.tsx              # 应用外壳（侧边导航 + 站场上下文 + 统计）
         ├── styles/main.css
-        ├── types/               # yard.ts switch.ts inspection.ts fault.ts workOrder.ts persistence.ts
+        ├── types/               # yard.ts switch.ts inspection.ts fault.ts workOrder.ts persistence.ts intake.ts
         ├── stores/              # index.ts yardStore.ts switchStore.ts faultStore.ts workOrderStore.ts
         ├── components/common/   # SeverityTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
+        ├── components/intake/   # IntakeItemTable.tsx（台账/离线两份并排 + 逐项核准）
         ├── hooks/               # useFaultFilter.ts useIdbTable.ts useAppStore.ts
-        ├── pages/               # YardList.tsx InspectionEntry.tsx FaultBoard.tsx WorkOrderPlan.tsx ProgressView.tsx BackupView.tsx
+        ├── pages/               # YardList.tsx InspectionEntry.tsx FaultBoard.tsx WorkOrderPlan.tsx ProgressView.tsx IntakeView.tsx BackupView.tsx
         ├── router/index.tsx     # 路由表（懒加载页面 + App 布局）
         ├── router/routes.ts     # 叶子模块：仅路径常量，切断 App ⇄ router 循环依赖
-        └── utils/               # severity.ts window.ts db.ts export.ts events.ts format.ts
+        ├── utils/               # severity.ts window.ts db.ts export.ts events.ts format.ts
+        └── utils/intake*        # intakePlan.ts（合并引擎）intakeDb.ts（锁/检查点）demoPack.ts
+    └── scripts/                 # intake.test.ts / ledgerHelper.ts / run-tests.mjs（npm run test:node）
 ```
 
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbrailswitch`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2 → v3 的迁移（v2 补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表；v3 新增离线包接收区 `intakeBatches` 表）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -104,7 +109,8 @@ sologsb101-1004/
   | `faults` | 病害 | id / inspectionId / part / severity / state / [inspectionId+part] |
   | `workOrders` | 天窗作业单 | id / code / state / windowStart / leader |
   | `restrictions` | 封锁 / 慢行条件 | id / yardId / switchCode |
-  | `settings` | 自定义字典 | id |
+  | `settings` | 自定义字典 / 断点演练开关 | id |
+  | `intakeBatches` | 离线包接收区批次（含逐项计划与检查点） | id / packageId / contentHash / status / kind / receivedAt |
 
 - **首屏自动播种**：`initDatabase()` 在 `yards` 表为空时写入演示数据（幂等）——2 个站场 × 各 4 组道岔 × 1~2 次巡检 × 每次 0~3 条病害 + 3 张天窗作业单（含 1 张刻意与人员时间窗冲突）+ 2 条封锁条件，父子记录通过 `yardId / switchId / inspectionId / faultIds` 互相引用。
 - **跨页状态**：全部放在 Redux Toolkit store（`yardStore / switchStore / faultStore / workOrderStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，store 自动重新拉取。
@@ -117,11 +123,25 @@ cd frontend
 npm install
 npm run dev        # http://localhost:22804
 npm run typecheck  # tsc --noEmit
+npm run test:node  # 离线包合并流程的 Node 验证（fake-indexeddb，见 scripts/intake.test.ts）
 npm run build      # tsc --noEmit && vite build
 npm run preview    # 预览构建产物
 ```
 
-## 八、容器化细节
+## 八、离线包接收与合并流程（/intake）
+
+巡检甲 / 乙班无网作业时各带一份本地数据，收工后把病害评定与天窗单交回调度台。为避免「后导入整条记录盖掉台账」，离线包先进**接收区**核准，再合并：
+
+1. **交回**：`/backup` 点「导出甲班 / 乙班离线包」（带 `kind=packageId` 标识），或直接接收无标识的旧整库备份。
+2. **入区核准**：按「站场名 + 道岔号 + 巡检日期 + 部件」把交回病害对回台账；等级 / 销号 / 天窗编号 / 时间窗+人员+机具编排冲突时，台账一份与离线一份**并排展示、逐项核准**（采用交回 / 两份并存 / 剔除），已一致的记录自动复用锁定。
+3. **双闸门**：只有**病害归属**（能落到道岔，缺失时可人工改指）与**作业单引用**（引用病害都能随包落库）同时成立，才允许写入。
+4. **写入与恢复**：每条记录独立事务、逐条检查点；失败后批次置 `paused`，记录**停下原因**，「从断点继续写入」从已完成记录之后继续，未确认内容始终留在接收区。
+5. **并发与去重**：接收与写入分别走 Web Locks（`gbrailswitch-intake-receive` / `-apply`），多标签接收 / 确认同一包（`packageId` 或内容哈希相同）**只能有一个完成**，重复提交直接驳回。
+6. **旧备份迁移**：缺少包标识的旧备份先列出迁移清单（旧字段名、字符串 `faultIds`、孤儿病害、断裂引用、记录条数）逐项勾选，核对后才生成合并计划。
+
+页面每份包都显示**待选冲突数、闸门拦截数、已应用数量、停下原因**；「演练写入中断」按钮可在第 N 条注入失败验证续传。相关代码：`types/intake.ts`、`utils/intakePlan.ts`（纯合并引擎）、`utils/intakeDb.ts`（持久化 / 锁 / 检查点）、`utils/export.ts` / `utils/demoPack.ts`、`pages/IntakeView.tsx`、`components/intake/IntakeItemTable.tsx`。
+
+## 九、容器化细节
 
 - `Dockerfile` 两阶段构建：`node:20-alpine` 安装依赖并执行 `npm run build`（内含 TypeScript 类型检查），随后拷贝 `dist` 到 `nginx:alpine`。
 - 运行阶段在 `COPY --from=builder /app/dist /usr/share/nginx/html` 之后执行 `RUN chmod -R a+rX /usr/share/nginx/html`，规避历史遗留的 favicon 权限 0600 导致 nginx 403 的问题。
