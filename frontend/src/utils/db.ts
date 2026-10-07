@@ -11,6 +11,13 @@ import type { Switch } from '../types/switch';
 import type { Inspection } from '../types/inspection';
 import type { Fault } from '../types/fault';
 import type { WorkOrder } from '../types/workOrder';
+import {
+  PACKAGE_STATUS_LABEL,
+  type ConflictChoice,
+  type ConflictItem,
+  type PackageStatus,
+  type SyncPackageRow,
+} from '../types/syncPackage';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 import { nowDateTime, shiftDate, todayDate, windowMinutes } from './window';
 import { nowIso, uuid } from './format';
@@ -19,7 +26,7 @@ import { nowIso, uuid } from './format';
 export const DB_NAME = 'gbrailswitch';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -55,6 +62,7 @@ class RailSwitchDatabase extends Dexie {
   workOrders!: Table<WorkOrderRow, string>;
   restrictions!: Table<SpeedRestrictionRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
+  syncPackages!: Table<SyncPackageRow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -70,7 +78,7 @@ class RailSwitchDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；道岔补充轨型索引，病害补充组合索引便于按巡检批量操作，
     //     作业单补充负责人索引，并新增封锁条件表
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         yards: 'id, name, region, mileage',
         switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
@@ -113,6 +121,12 @@ class RailSwitchDatabase extends Dexie {
           if (!Array.isArray(row.machines)) row.machines = [];
         });
       });
+
+    // v3：新增离线包接收区表 syncPackages（甲乙班交回的离线包先核准再合并，
+    //     含已应用游标 / 逐项冲突清单 / 跨标签合并租约），存量表结构不变
+    this.version(DB_SCHEMA_VERSION).stores({
+      syncPackages: 'id, status, crew, receivedAt',
+    });
   }
 }
 
@@ -528,6 +542,232 @@ export async function removeRestriction(id: string): Promise<void> {
   await db.restrictions.delete(id);
 }
 
+/* ========================== 离线包接收区 ========================== */
+
+export async function listPackages(): Promise<SyncPackageRow[]> {
+  const rows = await db.syncPackages.toArray();
+  return rows.sort((a, b) => b.receivedAt.localeCompare(a.receivedAt));
+}
+
+export async function getPackage(id: string): Promise<SyncPackageRow | undefined> {
+  return db.syncPackages.get(id);
+}
+
+/**
+ * 接收离线包入接收区（多标签互斥：查重 + 写入在同一事务，
+ * 同源标签页的事务互斥执行，同一包标识只能有一个标签页接收成功）。
+ */
+export async function stagePackage(row: SyncPackageRow): Promise<{ ok: boolean; reason: string }> {
+  return db.transaction('rw', db.syncPackages, async () => {
+    const existing = await db.syncPackages.get(row.id);
+    if (existing) {
+      return {
+        ok: false,
+        reason: `包 ${row.id} 已在接收区（${PACKAGE_STATUS_LABEL[existing.status]}），重复接收已拦截`,
+      };
+    }
+    await db.syncPackages.put(row);
+    return { ok: true, reason: '' };
+  });
+}
+
+/**
+ * 原子认领合并权（跨标签互斥）：仅当无人持有有效租约时置为「合并中」。
+ * 已合并 / 已退回 / 待逐项核准的包不允许认领，只能有一个标签页完成合并。
+ */
+export async function claimPackage(
+  packageId: string,
+  tabId: string,
+  leaseMs: number,
+): Promise<{ ok: boolean; reason: string }> {
+  return db.transaction('rw', db.syncPackages, async () => {
+    const row = await db.syncPackages.get(packageId);
+    if (!row) return { ok: false, reason: '包不存在或已被移除' };
+    if (row.status === 'merged') return { ok: false, reason: '该包已合并完成' };
+    if (row.status === 'rejected') return { ok: false, reason: '该包已退回班组' };
+    if (row.status === 'conflicted') return { ok: false, reason: '该包存在待核准冲突，请逐项核准' };
+    const leaseLive = Boolean(row.applyOwner) && row.applyLeaseUntil > Date.now();
+    if (leaseLive && row.applyOwner !== tabId) {
+      return { ok: false, reason: '另一标签页正在合并此包，稍候刷新查看' };
+    }
+    await db.syncPackages.put({
+      ...row,
+      status: 'applying',
+      applyOwner: tabId,
+      applyLeaseUntil: Date.now() + leaseMs,
+      stopReason: '',
+      updatedAt: nowIso(),
+    });
+    return { ok: true, reason: '' };
+  });
+}
+
+/**
+ * 合并写入一批记录并推进包游标（同一事务）。
+ * 写入失败时已完成的记录保持落库，恢复时按游标从断点之后继续。
+ */
+export async function applyPackageRecords(
+  packageId: string,
+  writes: { inspections?: InspectionRow[]; faults?: FaultRow[]; workOrders?: WorkOrderRow[] },
+  applied: { inspectionIds?: string[]; faultIds?: string[]; orderIds?: string[] },
+  leaseUntilTs: number,
+): Promise<void> {
+  await db.transaction('rw', [db.syncPackages, db.inspections, db.faults, db.workOrders], async () => {
+    if (writes.inspections?.length) await db.inspections.bulkPut(writes.inspections);
+    if (writes.faults?.length) await db.faults.bulkPut(writes.faults);
+    if (writes.workOrders?.length) await db.workOrders.bulkPut(writes.workOrders);
+    const row = await db.syncPackages.get(packageId);
+    if (!row) throw new Error('接收区记录已被移除');
+    await db.syncPackages.put({
+      ...row,
+      appliedInspectionIds: [...row.appliedInspectionIds, ...(applied.inspectionIds ?? [])],
+      appliedFaultIds: [...row.appliedFaultIds, ...(applied.faultIds ?? [])],
+      appliedOrderIds: [...row.appliedOrderIds, ...(applied.orderIds ?? [])],
+      applyLeaseUntil: leaseUntilTs,
+      updatedAt: nowIso(),
+    });
+  });
+}
+
+/** 保存合并计划生成的冲突清单（调用方负责合并已有核准结果） */
+export async function savePackageConflicts(packageId: string, conflicts: ConflictItem[]): Promise<void> {
+  await db.transaction('rw', db.syncPackages, async () => {
+    const row = await db.syncPackages.get(packageId);
+    if (!row) return;
+    await db.syncPackages.put({ ...row, conflicts, updatedAt: nowIso() });
+  });
+}
+
+/** 合并收尾：落定状态与停下原因，释放租约 */
+export async function settlePackage(packageId: string, status: PackageStatus, stopReason: string): Promise<void> {
+  await db.transaction('rw', db.syncPackages, async () => {
+    const row = await db.syncPackages.get(packageId);
+    if (!row) return;
+    await db.syncPackages.put({
+      ...row,
+      status,
+      stopReason,
+      applyOwner: null,
+      applyLeaseUntil: 0,
+      updatedAt: nowIso(),
+    });
+  });
+}
+
+/**
+ * 逐项核准冲突：按选择落台账（或保留台账不动），并推进包游标。
+ * 只写被核准的字段 / 单条记录，绝不拿包内整条记录盖掉台账其它字段。
+ * 全部冲突核准完成且包处于「待逐项核准」时，状态落为「已合并」。
+ */
+export async function resolvePackageConflict(
+  packageId: string,
+  conflictId: string,
+  choice: ConflictChoice,
+): Promise<{ ok: boolean; message: string }> {
+  return db.transaction('rw', [db.syncPackages, db.faults, db.workOrders], async () => {
+    const row = await db.syncPackages.get(packageId);
+    if (!row) return { ok: false, message: '包不存在或已被移除' };
+    const item = row.conflicts.find((conflict) => conflict.id === conflictId);
+    if (!item) return { ok: false, message: '冲突项不存在' };
+    if (item.resolution !== 'pending') return { ok: false, message: '该冲突已核准，不可重复处理' };
+
+    if (item.kind === 'severity' || item.kind === 'solved') {
+      if (choice === 'package') {
+        const ledgerFault = await db.faults.get(item.targetId);
+        const pkgFault = row.payload.faults.find((fault) => fault.id === item.packageRecordId);
+        if (ledgerFault && pkgFault) {
+          await db.faults.put(
+            item.kind === 'severity'
+              ? { ...ledgerFault, severity: pkgFault.severity }
+              : { ...ledgerFault, state: pkgFault.state, solvedAt: pkgFault.solvedAt },
+          );
+        }
+      }
+    } else if (choice === 'package') {
+      const pkgOrder = row.payload.workOrders.find((order) => order.id === item.packageRecordId);
+      if (pkgOrder) {
+        const faultIds = item.remappedFaultIds ?? pkgOrder.faultIds;
+        if (item.scheduleAction === 'update') {
+          // 对回命中的作业单：以包内字段更新台账单（保留台账 id 与创建时间）
+          const existing = await db.workOrders.get(item.targetId);
+          if (existing) {
+            await db.workOrders.put({
+              ...existing,
+              windowStart: pkgOrder.windowStart,
+              windowEnd: pkgOrder.windowEnd,
+              leader: pkgOrder.leader,
+              members: pkgOrder.members,
+              machines: pkgOrder.machines,
+              faultIds,
+              state: pkgOrder.state,
+              updatedAt: nowIso(),
+            });
+          }
+        } else {
+          // 新增作业单：台账占用单保留不动，包内单另行写入（两份都留）
+          await db.workOrders.put({ ...pkgOrder, faultIds, updatedAt: nowIso() });
+        }
+      }
+    }
+    // choice === 'ledger'：不动台账，仅标记核准结果
+
+    const conflicts = row.conflicts.map((conflict) =>
+      conflict.id === conflictId ? { ...conflict, resolution: choice } : conflict,
+    );
+    const appliedFaultIds = [...row.appliedFaultIds];
+    const appliedOrderIds = [...row.appliedOrderIds];
+    if (item.kind === 'schedule') {
+      if (!appliedOrderIds.includes(item.packageRecordId)) appliedOrderIds.push(item.packageRecordId);
+    } else {
+      // 该病害的所有冲突都核准后才推进病害游标
+      const siblingPending = conflicts.some(
+        (conflict) => conflict.packageRecordId === item.packageRecordId && conflict.resolution === 'pending',
+      );
+      if (!siblingPending && !appliedFaultIds.includes(item.packageRecordId)) {
+        appliedFaultIds.push(item.packageRecordId);
+      }
+    }
+    const allResolved = conflicts.every((conflict) => conflict.resolution !== 'pending');
+    const finish = allResolved && row.status === 'conflicted';
+    await db.syncPackages.put({
+      ...row,
+      conflicts,
+      appliedFaultIds,
+      appliedOrderIds,
+      status: finish ? 'merged' : row.status,
+      stopReason: finish ? '' : row.stopReason,
+      updatedAt: nowIso(),
+    });
+    return { ok: true, message: finish ? '全部冲突已核准，包合并完成' : '已核准该项' };
+  });
+}
+
+/** 退回：不并入台账，包留在接收区备查 */
+export async function rejectPackage(packageId: string): Promise<{ ok: boolean; reason: string }> {
+  return db.transaction('rw', db.syncPackages, async () => {
+    const row = await db.syncPackages.get(packageId);
+    if (!row) return { ok: false, reason: '包不存在或已被移除' };
+    if (row.status === 'merged') return { ok: false, reason: '已合并的包不能退回' };
+    if (row.status === 'applying' && row.applyLeaseUntil > Date.now()) {
+      return { ok: false, reason: '该包正在合并中，不能退回' };
+    }
+    await db.syncPackages.put({
+      ...row,
+      status: 'rejected',
+      stopReason: '已退回班组，未并入正式台账',
+      applyOwner: null,
+      applyLeaseUntil: 0,
+      updatedAt: nowIso(),
+    });
+    return { ok: true, reason: '' };
+  });
+}
+
+/** 从接收区移除包（仅清理接收区记录，不回滚已并入台账的内容） */
+export async function deletePackage(packageId: string): Promise<void> {
+  await db.syncPackages.delete(packageId);
+}
+
 /* ========================== 整库导入导出 ========================== */
 
 export interface DatabaseSnapshot {
@@ -587,11 +827,11 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
   );
 }
 
-/** 清空并重新播种 */
+/** 清空并重新播种（含接收区；整库导入 importSnapshot 不动接收区，未确认内容仍在） */
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions, db.syncPackages],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -600,6 +840,7 @@ export async function resetDatabase(): Promise<void> {
         db.faults.clear(),
         db.workOrders.clear(),
         db.restrictions.clear(),
+        db.syncPackages.clear(),
       ]);
     },
   );
@@ -608,15 +849,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [yards, switches, inspections, faults, workOrders, restrictions] = await Promise.all([
+  const [yards, switches, inspections, faults, workOrders, restrictions, syncPackages] = await Promise.all([
     db.yards.count(),
     db.switches.count(),
     db.inspections.count(),
     db.faults.count(),
     db.workOrders.count(),
     db.restrictions.count(),
+    db.syncPackages.count(),
   ]);
-  return { yards, switches, inspections, faults, workOrders, restrictions };
+  return { yards, switches, inspections, faults, workOrders, restrictions, syncPackages };
 }
 
 /** 结构版本信息 */

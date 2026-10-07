@@ -28,6 +28,7 @@ docker compose up -d --build # 代码改动后重建
 - 评定病害等级（轻 / 中 / 重）、批量调整、批量升级、手工销号与撤销
 - 勾选待修病害编排天窗作业单，分配时间窗 / 负责人 / 作业人员 / 机具，并做**时间窗 + 人员 + 机具三重冲突校验**
 - 按天窗批次推进状态（待编排 → 已下达 → 作业中 → 已完成），推进到已完成时**自动回写病害销号**
+- 甲乙班离线包交回：先入**接收区**核准（病害归属 + 作业单引用同时成立）再逐条合并，等级 / 销号 / 作业编排冲突**保留两份逐项核准**，断点可恢复，多标签接收互斥，旧备份先生成迁移清单
 - 登记慢行 / 封锁条件，查看结构版本并导出 / 导入整库 JSON
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
@@ -54,6 +55,7 @@ docker compose up -d --build # 代码改动后重建
 | `/faults` | 病害评定与销号 | 评定等级、批量调整、手工销号与撤销 |
 | `/workorders` | 天窗作业单编排 | 勾选病害成单、分配时间窗与人员机具并校验冲突 |
 | `/progress` | 作业进度与销号回写 | 更新状态，完成项自动回写病害销号 |
+| `/sync` | 离线包接收区 | 甲乙班离线包核准合并、逐项冲突核准、断点恢复、旧备份迁移清单 |
 | `/backup` | 封锁条件与版本 | 登记慢行 / 封锁条件，结构版本与 JSON 管理 |
 
 > 路由使用 `createBrowserRouter`（History 模式），真实路径 `/yards`、`/workorders` 等可直接访问，
@@ -80,20 +82,20 @@ sologsb101-1004/
         ├── main.tsx             # 入口：Redux Provider + ThemeProvider + RouterProvider
         ├── App.tsx              # 应用外壳（侧边导航 + 站场上下文 + 统计）
         ├── styles/main.css
-        ├── types/               # yard.ts switch.ts inspection.ts fault.ts workOrder.ts persistence.ts
-        ├── stores/              # index.ts yardStore.ts switchStore.ts faultStore.ts workOrderStore.ts
+        ├── types/               # yard.ts switch.ts inspection.ts fault.ts workOrder.ts persistence.ts syncPackage.ts
+        ├── stores/              # index.ts yardStore.ts switchStore.ts faultStore.ts workOrderStore.ts packageStore.ts
         ├── components/common/   # SeverityTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
         ├── hooks/               # useFaultFilter.ts useIdbTable.ts useAppStore.ts
-        ├── pages/               # YardList.tsx InspectionEntry.tsx FaultBoard.tsx WorkOrderPlan.tsx ProgressView.tsx BackupView.tsx
+        ├── pages/               # YardList.tsx InspectionEntry.tsx FaultBoard.tsx WorkOrderPlan.tsx ProgressView.tsx PackageIntake.tsx BackupView.tsx
         ├── router/index.tsx     # 路由表（懒加载页面 + App 布局）
         ├── router/routes.ts     # 叶子模块：仅路径常量，切断 App ⇄ router 循环依赖
-        └── utils/               # severity.ts window.ts db.ts export.ts events.ts format.ts
+        └── utils/               # severity.ts window.ts db.ts events.ts format.ts packageIO.ts packageLock.ts
 ```
 
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbrailswitch`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表）与 v2 → v3 的新表迁移（新增离线包接收区 `syncPackages`）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -104,7 +106,16 @@ sologsb101-1004/
   | `faults` | 病害 | id / inspectionId / part / severity / state / [inspectionId+part] |
   | `workOrders` | 天窗作业单 | id / code / state / windowStart / leader |
   | `restrictions` | 封锁 / 慢行条件 | id / yardId / switchCode |
+  | `syncPackages` | 离线包接收区 | id / status / crew / receivedAt |
   | `settings` | 自定义字典 | id |
+
+- **离线包接收区（`/sync`）**：甲乙班无网时各带一份离线包（`/sync` 页可导出甲班 / 乙班包），收工后交回调度台。包先落 `syncPackages` 接收区，**核准**（病害归属 + 作业单引用同时成立）后才逐条合并进正式台账：
+  - **对回口径**：病害按 道岔 + 日期 + 部件（+类型）对回，作业单按 id / 编号对回，道岔按 id → 站场+编号 → 唯一编号兜底；
+  - **逐项核准**：等级、销号、作业编排不一致时生成冲突项，台账与包内两份都保留，逐项选择「保留台账 / 采用包内」，不用后导入的整条记录盖掉台账；
+  - **断点恢复**：每条记录一个事务（台账写入 + 包游标推进原子完成），写入失败停在断点，恢复后从已完成记录之后继续，未确认内容留在接收区；
+  - **多标签互斥**：接收按包标识同事务查重，合并靠 `applyOwner` + 租约认领，同一包只能有一个标签页完成；
+  - **旧备份迁移**：缺少包标识的整库备份先生成迁移清单（含归属 / 引用问题标注），核对后迁入接收区走同一流程；
+  - 页面每包可见：待选冲突数、已应用数量（病害 / 作业单 / 巡检游标）、停下原因。
 
 - **首屏自动播种**：`initDatabase()` 在 `yards` 表为空时写入演示数据（幂等）——2 个站场 × 各 4 组道岔 × 1~2 次巡检 × 每次 0~3 条病害 + 3 张天窗作业单（含 1 张刻意与人员时间窗冲突）+ 2 条封锁条件，父子记录通过 `yardId / switchId / inspectionId / faultIds` 互相引用。
 - **跨页状态**：全部放在 Redux Toolkit store（`yardStore / switchStore / faultStore / workOrderStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，store 自动重新拉取。
