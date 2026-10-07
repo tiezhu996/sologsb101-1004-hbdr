@@ -1,0 +1,56 @@
+/* 铁路道岔巡检与天窗修编排台 · 全局样式 */
+
+:root {
+  --gb-bg: #f4f6f8;
+  --gb-surface: #ffffff;
+  --gb-ink: #12211f;
+  --gb-blue: #1565c0;
+  --gb-teal: #00897b;
+  --gb-orange: #ed6c02;
+  --gb-red: #d32f2f;
+  --gb-line: rgba(21, 101, 192, 0.16);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--gb-bg);
+  color: #1a2027;
+  font-family: 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Source Han Sans SC', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.45;
+  background-image:
+    radial-gradient(circle at 6% 10%, rgba(21, 101, 192, 0.07), transparent 40%),
+    radial-gradient(circle at 94% 8%, rgba(0, 137, 123, 0.06), transparent 36%),
+    repeating-linear-gradient(0deg, rgba(18, 33, 31, 0.014) 0 1px, transparent 1px 5px);
+}
+
+.gb-mono {
+  font-family: 'SFMono-Regular', 'JetBrains Mono', Menlo, Consolas, monospace;
+  font-size: 12.5px;
+}
+
+.gb-row-heavy {
+  background: #fdecea;
+}
+
+.gb-row-planned {
+  background: #e8f4fd;
+}
